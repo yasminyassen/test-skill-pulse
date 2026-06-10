@@ -1,73 +1,156 @@
-import sqlite3, json, os, time, random, hashlib
+from __future__ import annotations
+import hashlib, secrets
+from dataclasses import dataclass, field
 from datetime import datetime
-x = []
-data2 = {}
-temp = 0
-FLAG = True
-db = None
-USERS = []
-pp = 0.15   
-z = "admin123"  
+from typing import Optional
+from contextlib import contextmanager
+import sqlite3
 
-def do_stuff(a, b, c, d=None, e=None, f=False):
-    global x, data2, temp, FLAG, db, USERS, pp
-    
-    if a == 1:
-        db = sqlite3.connect("mydb.db")
-        cur = db.cursor()
-        cur.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER, name TEXT, pass TEXT, bal REAL, stuff TEXT)")
-        db.commit()
-        return "ok"
-    elif a == 2:
-        cur = db.cursor()
-        cur.execute(f"INSERT INTO users VALUES (NULL, '{b}', '{c}', {d}, '{e}')")
-        db.commit()
-        USERS.append({'n': b, 'p': c})  # password plain text 🚨
-        return 1
-    elif a == 3:
-        res = db.cursor().execute(f"SELECT bal FROM users WHERE name='{b}'").fetchone()
-        if res:
-            if res[0] >= c:
-                db.cursor().execute(f"UPDATE users SET bal=bal-{c} WHERE name='{b}'")
-                db.commit()
-                if d: 
-                    c = c * (1 - pp)
-                x.append({'u': b, 'a': c, 't': time.time()})
-                return True
-            else:
-                return False
-        return None  
-    elif a == 4:
-        total = 0
-        for i in x:
-            total = total + i['a']
-        avg = total / len(x)  
-        return [total, avg, len(x)]
-    elif a == 5:
-        time.sleep(2)
-        return "sent"
-    elif a == 6:
-        pass
-    elif a == 7:
-        pass
+# ── Data Models ─────────────────────────────────────
+@dataclass
+class User:
+    username: str
+    password_hash: str
+    balance: float
+    role: str = "customer"
+    id: Optional[int] = None
 
-def calc(items):
-    t = 0
-    for i in items:
-        t = t + i['a']
-    return t / len(items)
+@dataclass
+class Transaction:
+    user_id: int
+    amount: float
+    timestamp: datetime = field(default_factory=datetime.now)
+    description: str = ""
 
-def process(u, p, m, i=None):
-    if u == "admin" and p == z:
-        return "ADMIN_OK"
-    for user in USERS:
-        if user['n'] == u and user['p'] == p:
-            if m == "buy":
-                return do_stuff(3, u, i['price'], i.get('disc'))
-            elif m == "report":
-                return do_stuff(4)
-    return "NO"
+# ── Database Layer ───────────────────────────────────
+class Database:
+    def __init__(self, db_path: str):
+        self._path = db_path
 
-do_stuff(1)
-print("DB connected")
-do_stuff(2, "admin", z, 9999, "super")
+    @contextmanager
+    def connection(self):
+        conn = sqlite3.connect(self._path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def initialize(self) -> None:
+        with self.connection() as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    balance REAL NOT NULL DEFAULT 0,
+                    role    TEXT NOT NULL DEFAULT 'customer'
+                );
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER REFERENCES users(id),
+                    amount  REAL NOT NULL,
+                    description TEXT,
+                    created_at TEXT NOT NULL
+                );
+            """)
+
+# ── Security Utilities ──────────────────────────────
+class PasswordHasher:
+    @staticmethod
+    def hash(password: str) -> str:
+        salt = secrets.token_hex(16)
+        h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 260_000)
+        return f"{salt}${h.hex()}"
+
+    @staticmethod
+    def verify(password: str, stored_hash: str) -> bool:
+        salt, expected = stored_hash.split("$")
+        h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 260_000)
+        return secrets.compare_digest(h.hex(), expected)
+
+# ── Repository (Data Access) ────────────────────────
+class UserRepository:
+    def __init__(self, db: Database):
+        self._db = db
+
+    def create(self, user: User) -> User:
+        with self._db.connection() as conn:
+            cursor = conn.execute(
+                "INSERT INTO users (username, password_hash, balance, role) VALUES (?,?,?,?)",
+                (user.username, user.password_hash, user.balance, user.role)
+            )
+            return User(**{**user.__dict__, "id": cursor.lastrowid})
+
+    def find_by_username(self, username: str) -> Optional[User]:
+        with self._db.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE username = ?", (username,)
+            ).fetchone()
+            return User(**dict(row)) if row else None
+
+# ── Service Layer (Business Logic) ──────────────────
+class StoreService:
+    def __init__(self, db: Database, user_repo: UserRepository):
+        self._db = db
+        self._users = user_repo
+
+    def register_user(self, username: str, password: str,
+                      initial_balance: float = 0.0) -> User:
+        hashed = PasswordHasher.hash(password)
+        return self._users.create(User(username, hashed, initial_balance))
+
+    def authenticate(self, username: str, password: str) -> Optional[User]:
+        user = self._users.find_by_username(username)
+        if user and PasswordHasher.verify(password, user.password_hash):
+            return user
+        return None
+
+    def purchase(self, username: str, amount: float,
+                 description: str = "") -> Transaction:
+        user = self._users.find_by_username(username)
+        if not user:
+            raise ValueError(f"User '{username}' not found")
+        if user.balance < amount:
+            raise ValueError(f"Insufficient balance: {user.balance:.2f} < {amount:.2f}")
+
+        with self._db.connection() as conn:
+            conn.execute(
+                "UPDATE users SET balance = balance - ? WHERE id = ?",
+                (amount, user.id)
+            )
+            tx = Transaction(user.id, amount, description=description)
+            conn.execute(
+                "INSERT INTO transactions (user_id,amount,description,created_at) VALUES (?,?,?,?)",
+                (tx.user_id, tx.amount, tx.description, tx.timestamp.isoformat())
+            )
+        return tx
+
+    def get_sales_report(self) -> dict:
+        with self._db.connection() as conn:
+            rows = conn.execute("SELECT amount FROM transactions").fetchall()
+        if not rows:
+            return {"total": 0.0, "average": 0.0, "count": 0}
+        amounts = [r["amount"] for r in rows]
+        return {
+            "total":   round(sum(amounts), 2),
+            "average": round(sum(amounts) / len(amounts), 2),
+            "count":   len(amounts),
+        }
+
+# ── Dependency Injection / Entry Point ──────────────
+def create_store(db_path: str = "store.db") -> StoreService:
+    db   = Database(db_path)
+    db.initialize()
+    repo = UserRepository(db)
+    return StoreService(db, repo)
+
+if __name__ == "__main__":
+    store = create_store()
+    user  = store.register_user("ahmed", "s3cur3P@ss", balance=500.0)
+    tx    = store.purchase("ahmed", 120.0, "MacBook Pro case")
+    print(store.get_sales_report())
