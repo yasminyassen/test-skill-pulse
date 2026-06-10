@@ -1,156 +1,141 @@
 from __future__ import annotations
-import hashlib, secrets
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
+from decimal import Decimal
+from enum import Enum, auto
 from typing import Optional
-from contextlib import contextmanager
-import sqlite3
+
+PLATFORM_FEE_RATE   = Decimal("0.03")   # 3% رسوم المنصة
+VIP_DISCOUNT_RATE   = Decimal("0.10")   # 10% خصم VIP
+LOYALTY_THRESHOLD   = 5                 # طلبات لازمة للخصم
+LOYALTY_DISCOUNT    = Decimal("50")     # جنيه خصم ولاء
+VAT_RATE            = Decimal("0.14")   # 14% ضريبة
+
+# ── Enums — بدل strings مجهولة ──────────────────────
+class PaymentMethod(Enum):
+    CARD      = "card"
+    WALLET    = "wallet"
+    INSTAPAY  = "instapay"
+
+class Currency(Enum):
+    USD = ("USD", Decimal("1.0"))
+    EGP = ("EGP", Decimal("49.5"))
+    SAR = ("SAR", Decimal("3.75"))
+    def __init__(self, code: str, rate: Decimal): self.code=code; self.rate=rate
+
+class CustomerTier(Enum):
+    STANDARD = auto()
+    VIP      = auto()
 
 # ── Data Models ─────────────────────────────────────
-@dataclass
-class User:
-    username: str
-    password_hash: str
-    balance: float
-    role: str = "customer"
-    id: Optional[int] = None
+@dataclass(frozen=True)
+class OrderItem:
+    product_id:  int
+    name:        str
+    unit_price:  Decimal
+    quantity:    int
 
-@dataclass
-class Transaction:
-    user_id: int
-    amount: float
-    timestamp: datetime = field(default_factory=datetime.now)
-    description: str = ""
+    @property
+    def subtotal(self) -> Decimal:
+        return self.unit_price * self.quantity
 
-# ── Database Layer ───────────────────────────────────
-class Database:
-    def __init__(self, db_path: str):
-        self._path = db_path
+@dataclass(frozen=True)
+class PaymentContext:
+    amount:          Decimal
+    token:           str
+    payment_method:  PaymentMethod
+    customer_tier:   CustomerTier
+    customer_age:    int
+    region_code:     str
+    order_count:     int
+    currency:        Currency
+    items:           list[OrderItem]
+    apply_vat:       bool
 
-    @contextmanager
-    def connection(self):
-        conn = sqlite3.connect(self._path)
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+@dataclass(frozen=True)
+class PaymentBreakdown:
+    base_amount:     Decimal
+    platform_fee:    Decimal
+    vip_discount:    Decimal
+    loyalty_discount:Decimal
+    items_total:     Decimal
+    vat:             Decimal
 
-    def initialize(self) -> None:
-        with self.connection() as conn:
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username TEXT UNIQUE NOT NULL,
-                    password_hash TEXT NOT NULL,
-                    balance REAL NOT NULL DEFAULT 0,
-                    role    TEXT NOT NULL DEFAULT 'customer'
-                );
-                CREATE TABLE IF NOT EXISTS transactions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER REFERENCES users(id),
-                    amount  REAL NOT NULL,
-                    description TEXT,
-                    created_at TEXT NOT NULL
-                );
-            """)
+    @property
+    def grand_total(self) -> Decimal:
+        return (self.base_amount
+                - self.platform_fee
+                - self.vip_discount
+                - self.loyalty_discount
+                + self.items_total
+                + self.vat)
 
-# ── Security Utilities ──────────────────────────────
-class PasswordHasher:
-    @staticmethod
-    def hash(password: str) -> str:
-        salt = secrets.token_hex(16)
-        h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 260_000)
-        return f"{salt}${h.hex()}"
+# ── Validation — Early Return بدل Nesting ───────────
+def _validate_payment(ctx: PaymentContext) -> None:
+    """ترمي ValueError بمسجة واضحة لو في مشكلة"""
+    if ctx.amount <= 0:
+        raise ValueError(f"Invalid amount: {ctx.amount}")
+    if ctx.customer_age < 18:
+        raise ValueError(f"Customer must be 18+, got {ctx.customer_age}")
+    if not ctx.token:
+        raise ValueError("Payment token is required")
 
-    @staticmethod
-    def verify(password: str, stored_hash: str) -> bool:
-        salt, expected = stored_hash.split("$")
-        h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 260_000)
-        return secrets.compare_digest(h.hex(), expected)
+# ── Pure Calculation Functions — كل واحدة تعمل حاجة واحدة ──
+def _calc_platform_fee(amount: Decimal) -> Decimal:
+    return (amount * PLATFORM_FEE_RATE).quantize(Decimal("0.01"))
 
-# ── Repository (Data Access) ────────────────────────
-class UserRepository:
-    def __init__(self, db: Database):
-        self._db = db
+def _calc_vip_discount(amount: Decimal, tier: CustomerTier) -> Decimal:
+    if tier is not CustomerTier.VIP:
+        return Decimal("0")
+    return (amount * VIP_DISCOUNT_RATE).quantize(Decimal("0.01"))
 
-    def create(self, user: User) -> User:
-        with self._db.connection() as conn:
-            cursor = conn.execute(
-                "INSERT INTO users (username, password_hash, balance, role) VALUES (?,?,?,?)",
-                (user.username, user.password_hash, user.balance, user.role)
-            )
-            return User(**{**user.__dict__, "id": cursor.lastrowid})
+def _calc_loyalty_discount(order_count: int) -> Decimal:
+    if order_count > LOYALTY_THRESHOLD:
+        return LOYALTY_DISCOUNT
+    return Decimal("0")
 
-    def find_by_username(self, username: str) -> Optional[User]:
-        with self._db.connection() as conn:
-            row = conn.execute(
-                "SELECT * FROM users WHERE username = ?", (username,)
-            ).fetchone()
-            return User(**dict(row)) if row else None
+def _calc_items_total(items: list[OrderItem], currency: Currency) -> Decimal:
+    total = sum(item.subtotal for item in items)
+    return (total * currency.rate).quantize(Decimal("0.01"))
 
-# ── Service Layer (Business Logic) ──────────────────
-class StoreService:
-    def __init__(self, db: Database, user_repo: UserRepository):
-        self._db = db
-        self._users = user_repo
+def _calc_vat(items_total: Decimal, apply_vat: bool) -> Decimal:
+    if not apply_vat:
+        return Decimal("0")
+    return (items_total * VAT_RATE).quantize(Decimal("0.01"))
 
-    def register_user(self, username: str, password: str,
-                      initial_balance: float = 0.0) -> User:
-        hashed = PasswordHasher.hash(password)
-        return self._users.create(User(username, hashed, initial_balance))
+# ── Public API — نقطة دخول واحدة واضحة ─────────────
+def process_payment(ctx: PaymentContext) -> PaymentBreakdown:
+    _validate_payment(ctx)
 
-    def authenticate(self, username: str, password: str) -> Optional[User]:
-        user = self._users.find_by_username(username)
-        if user and PasswordHasher.verify(password, user.password_hash):
-            return user
-        return None
+    fee      = _calc_platform_fee(ctx.amount)
+    vip_disc = _calc_vip_discount(ctx.amount, ctx.customer_tier)
+    loyalty  = _calc_loyalty_discount(ctx.order_count)
+    items_t  = _calc_items_total(ctx.items, ctx.currency)
+    vat      = _calc_vat(items_t, ctx.apply_vat)
 
-    def purchase(self, username: str, amount: float,
-                 description: str = "") -> Transaction:
-        user = self._users.find_by_username(username)
-        if not user:
-            raise ValueError(f"User '{username}' not found")
-        if user.balance < amount:
-            raise ValueError(f"Insufficient balance: {user.balance:.2f} < {amount:.2f}")
+    return PaymentBreakdown(
+        base_amount=ctx.amount,
+        platform_fee=fee,
+        vip_discount=vip_disc,
+        loyalty_discount=loyalty,
+        items_total=items_t,
+        vat=vat,
+    )
 
-        with self._db.connection() as conn:
-            conn.execute(
-                "UPDATE users SET balance = balance - ? WHERE id = ?",
-                (amount, user.id)
-            )
-            tx = Transaction(user.id, amount, description=description)
-            conn.execute(
-                "INSERT INTO transactions (user_id,amount,description,created_at) VALUES (?,?,?,?)",
-                (tx.user_id, tx.amount, tx.description, tx.timestamp.isoformat())
-            )
-        return tx
-
-    def get_sales_report(self) -> dict:
-        with self._db.connection() as conn:
-            rows = conn.execute("SELECT amount FROM transactions").fetchall()
-        if not rows:
-            return {"total": 0.0, "average": 0.0, "count": 0}
-        amounts = [r["amount"] for r in rows]
-        return {
-            "total":   round(sum(amounts), 2),
-            "average": round(sum(amounts) / len(amounts), 2),
-            "count":   len(amounts),
-        }
-
-# ── Dependency Injection / Entry Point ──────────────
-def create_store(db_path: str = "store.db") -> StoreService:
-    db   = Database(db_path)
-    db.initialize()
-    repo = UserRepository(db)
-    return StoreService(db, repo)
 
 if __name__ == "__main__":
-    store = create_store()
-    user  = store.register_user("ahmed", "s3cur3P@ss", balance=500.0)
-    tx    = store.purchase("ahmed", 120.0, "MacBook Pro case")
-    print(store.get_sales_report())
+    ctx = PaymentContext(
+        amount=Decimal("500"),
+        token="tok_123",
+        payment_method=PaymentMethod.CARD,
+        customer_tier=CustomerTier.VIP,
+        customer_age=25,
+        region_code="EG",
+        order_count=6,
+        currency=Currency.EGP,
+        items=[OrderItem(1, "MacBook Case", Decimal("100"), 2)],
+        apply_vat=True,
+    )
+    result = process_payment(ctx)
+    print(f"Grand total: {result.grand_total} EGP")
+    print(f"Platform fee: {result.platform_fee}")
+    print(f"VIP discount: {result.vip_discount}")
