@@ -104,6 +104,10 @@ def _calc_vat(items_total: Decimal, apply_vat: bool) -> Decimal:
 
 # ── Public API — نقطة دخول واحدة واضحة ─────────────
 def process_payment(ctx: PaymentContext) -> PaymentBreakdown:
+    """
+    تحسب تفاصيل الدفع الكاملة.
+    ترمي ValueError لو في مشكلة في الـ input.
+    """
     _validate_payment(ctx)
 
     fee      = _calc_platform_fee(ctx.amount)
@@ -121,7 +125,7 @@ def process_payment(ctx: PaymentContext) -> PaymentBreakdown:
         vat=vat,
     )
 
-
+# ── Usage — مقروء بدون تعليقات ──────────────────────
 if __name__ == "__main__":
     ctx = PaymentContext(
         amount=Decimal("500"),
